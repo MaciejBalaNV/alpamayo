@@ -97,13 +97,25 @@ def shard_model_inputs(inputs: dict, cp_group=None) -> dict:
 
 def apply_context_parallel_to_qwen(model: torch.nn.Module):
     """
-    Monkey-patch the Qwen3-VL attention to use Context Parallelism.
+    Monkey-patch the Qwen attention to use Context Parallelism.
     Only patches the VLM, leaving the Expert model unaffected.
     """
-    import transformers.models.qwen2_vl.modeling_qwen2_vl as qwen2_vl_modeling
-    
-    # We patch the Flash Attention 2 forward method of Qwen
-    original_forward = qwen2_vl_modeling.Qwen2VLFlashAttention2.forward
+    if model is None:
+        logger.warning("No model provided to apply_context_parallel_to_qwen. Cannot dynamically patch.")
+        return
+
+    # Dynamically find the attention class from the instantiated model
+    # The structure is typically model.vlm.model.layers[0].self_attn
+    try:
+        # We look for the first layer's attention module
+        attn_module = model.vlm.model.layers[0].self_attn
+        attn_class = attn_module.__class__
+        qwen_modeling_module = __import__(attn_class.__module__, fromlist=["apply_rotary_pos_emb"])
+    except Exception as e:
+        logger.error(f"Failed to find attention class dynamically: {e}")
+        return
+
+    original_forward = attn_class.forward
     
     def cp_flash_attention_forward(
         self,
@@ -115,6 +127,7 @@ def apply_context_parallel_to_qwen(model: torch.nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs
     ):
         cp_group = get_cp_group()
         cp_size = get_cp_size()
@@ -125,13 +138,13 @@ def apply_context_parallel_to_qwen(model: torch.nn.Module):
         # fallback to the original Hugging Face implementation.
         if cp_size <= 1 or q_len == 1:
             return original_forward(
-                self, hidden_states, attention_mask, position_ids,
-                past_key_value, output_attentions, use_cache, 
-                cache_position, position_embeddings
+                self, hidden_states, attention_mask=attention_mask, position_ids=position_ids,
+                past_key_value=past_key_value, output_attentions=output_attentions, use_cache=use_cache, 
+                cache_position=cache_position, position_embeddings=position_embeddings, **kwargs
             )
             
         # PREFILL PHASE (q_len > 1) with Context Parallelism
-        # Project Q, K, V
+        # Project Q, K, V on the full sequence
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -141,47 +154,81 @@ def apply_context_parallel_to_qwen(model: torch.nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         
-        # Apply RoPE
+        # Apply RoPE on the full sequence
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            # apply_rotary_pos_emb is assumed to exist in the module namespace
-            query_states, key_states = qwen2_vl_modeling.apply_rotary_pos_emb(
+            query_states, key_states = qwen_modeling_module.apply_rotary_pos_emb(
                 query_states, key_states, cos, sin
             )
             
+        # Slice Q, K, V for Context Parallelism
+        seq_len = q_len
+        pad_len = (cp_size - (seq_len % cp_size)) % cp_size
+        
+        if pad_len > 0:
+            query_states_pad = torch.nn.functional.pad(query_states, (0, 0, 0, 0, 0, pad_len))
+            key_states_pad = torch.nn.functional.pad(key_states, (0, 0, 0, 0, 0, pad_len))
+            value_states_pad = torch.nn.functional.pad(value_states, (0, 0, 0, 0, 0, pad_len))
+        else:
+            query_states_pad = query_states
+            key_states_pad = key_states
+            value_states_pad = value_states
+            
+        chunk_size = query_states_pad.shape[1] // cp_size
+        cp_rank = get_cp_rank()
+        start_idx = cp_rank * chunk_size
+        end_idx = start_idx + chunk_size
+        
+        q_chunk = query_states_pad[:, start_idx:end_idx].contiguous()
+        k_chunk = key_states_pad[:, start_idx:end_idx].contiguous()
+        v_chunk = value_states_pad[:, start_idx:end_idx].contiguous()
+        
         # KV Cache logic for Prefill Phase
         if past_key_value is not None:
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_position
+            # We only store the local chunk of the sequence in the KV cache to distribute memory!
+            # Since HF dynamic cache update logic expects to concatenate whatever we pass,
+            # passing k_chunk appends only the local sequence tokens to this GPU's KV cache.
+            # During decode phase, ALL GPUs will execute identical q_len=1 steps and append the identical decode token.
+            _, _ = past_key_value.update(
+                k_chunk, v_chunk, self.layer_idx, {"cache_position": None}
             )
 
         # Use Ring Attention or Ulysses to split Q, K, V sequence across GPUs
         if HAS_RING_ATTN:
-            # Context Parallelism splits the sequence dimension.
-            # Assume input hidden_states is already sharded across the sequence dim:
-            # (bsz, q_len // cp_size, num_heads, head_dim)
-            
-            # If causality is needed, ring_flash_attn supports it
             is_causal = True if attention_mask is None else False
             
-            attn_output = ring_flash_attn_func(
-                query_states, key_states, value_states,
+            # ring_flash_attn_func computes global attention over the CP group
+            # and returns the local chunk of the attention output.
+            attn_output_chunk = ring_flash_attn_func(
+                q_chunk, k_chunk, v_chunk,
                 causal=is_causal,
                 group=cp_group
             )
             
+            # Since we want to optimize for latency rather than pure memory, 
+            # we all_gather the attention output immediately to let the MLP process 
+            # the full sequence natively (which runs very fast via Tensor Cores)
+            tensor_list = [torch.empty_like(attn_output_chunk) for _ in range(cp_size)]
+            dist.all_gather(tensor_list, attn_output_chunk, group=cp_group)
+            attn_output = torch.cat(tensor_list, dim=1)
+            
+            # Strip padding if we added any
+            if pad_len > 0:
+                attn_output = attn_output[:, :-pad_len]
+            
             attn_output = attn_output.view(bsz, q_len, self.hidden_size)
             attn_output = self.o_proj(attn_output)
+            
             return attn_output, None, past_key_value
         else:
             # Fallback if CP is requested but ring_flash_attn is unavailable
             logger.warning_once("Using fallback local attention for prefill. CP is disabled.")
             return original_forward(
-                self, hidden_states, attention_mask, position_ids,
-                past_key_value, output_attentions, use_cache, 
-                cache_position, position_embeddings
+                self, hidden_states, attention_mask=attention_mask, position_ids=position_ids,
+                past_key_value=past_key_value, output_attentions=output_attentions, use_cache=use_cache, 
+                cache_position=cache_position, position_embeddings=position_embeddings, **kwargs
             )
 
     # Patch the method
-    qwen2_vl_modeling.Qwen2VLFlashAttention2.forward = cp_flash_attention_forward
-    logger.info("Successfully patched Qwen2VLFlashAttention2 with Context Parallelism support.")
+    attn_class.forward = cp_flash_attention_forward
+    logger.info(f"Successfully patched {attn_class.__name__} with Context Parallelism support.")

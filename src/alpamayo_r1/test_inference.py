@@ -66,8 +66,8 @@ inputs = processor.apply_chat_template(
     return_tensors="pt",
 )
 
-# Shard inputs before passing them into the model to save memory
-inputs = shard_model_inputs(inputs)
+# We do not shard inputs before the model. 
+# Sharding is handled internally within the attention layer to preserve vision-token alignment.
 
 model_inputs = {
     "tokenized_data": inputs,
