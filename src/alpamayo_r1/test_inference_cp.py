@@ -96,8 +96,10 @@ def main() -> None:
     torch.cuda.synchronize()
     t_start = time.perf_counter()
 
+    torch.cuda.nvtx.range_push("inference")
     torch.cuda.manual_seed_all(42)
     with torch.autocast("cuda", dtype=torch.bfloat16):
+        torch.cuda.nvtx.range_push("vlm_generate_and_diffusion")
         pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
             data=model_inputs,
             top_p=0.98,
@@ -106,6 +108,8 @@ def main() -> None:
             max_generation_length=256,
             return_extra=True,
         )
+        torch.cuda.nvtx.range_pop()  # vlm_generate_and_diffusion
+    torch.cuda.nvtx.range_pop()  # inference
 
     torch.cuda.synchronize()
     t_end = time.perf_counter()

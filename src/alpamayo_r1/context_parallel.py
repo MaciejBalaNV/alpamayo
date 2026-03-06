@@ -113,14 +113,17 @@ def _pad_dim(tensor: torch.Tensor, dim: int, pad_size: int, value: int | float =
 # ---------------------------------------------------------------------------
 
 def _gather_kv_cache(cache: Any, original_seq_len: int) -> None:
-    """All-gather every layer's K and V, then trim padding in-place."""
+    """All-gather every layer's K and V, then trim padding in-place.
+
+    Works with the transformers >=4.57 ``DynamicCache`` whose per-layer
+    state lives in ``cache.layers[i].keys / .values``.
+    """
     cp = get_cp_group()
     if not cp.is_active:
         return
-    for i in range(len(cache.key_cache)):
-        cache.key_cache[i] = _all_gather(cache.key_cache[i], dim=2)[:, :, :original_seq_len, :]
-        cache.value_cache[i] = _all_gather(cache.value_cache[i], dim=2)[:, :, :original_seq_len, :]
-    cache._seen_tokens = original_seq_len
+    for layer in cache.layers:
+        layer.keys = _all_gather(layer.keys, dim=2)[:, :, :original_seq_len, :]
+        layer.values = _all_gather(layer.values, dim=2)[:, :, :original_seq_len, :]
 
 
 # ---------------------------------------------------------------------------
@@ -155,22 +158,30 @@ def _cp_attention_forward(
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
+    torch.cuda.nvtx.range_push("cp/qkv_proj")
     query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
     key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    torch.cuda.nvtx.range_pop()
 
+    torch.cuda.nvtx.range_push("cp/rope")
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    torch.cuda.nvtx.range_pop()
 
     if past_key_values is not None:
+        torch.cuda.nvtx.range_push("cp/kv_cache_update")
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         key_states, value_states = past_key_values.update(
             key_states, value_states, self.layer_idx, cache_kwargs,
         )
+        torch.cuda.nvtx.range_pop()
 
     # --- all-gather K, V then slice for causal ---
+    torch.cuda.nvtx.range_push("cp/allgather_kv")
     full_key = _all_gather(key_states, dim=2)
     full_value = _all_gather(value_states, dim=2)
+    torch.cuda.nvtx.range_pop()
 
     # Rank r's Q covers global positions [r*C, (r+1)*C).
     # Keep K/V for positions [0, (r+1)*C) so that flash_attn with
@@ -180,6 +191,13 @@ def _cp_attention_forward(
     causal_key = full_key[:, :, :end_pos, :]
     causal_value = full_value[:, :, :end_pos, :]
 
+    # The decoder layer forwards extra kwargs (position_ids, use_cache)
+    # that are not attention-forward parameters.  position_ids in
+    # particular triggers flash-attn's packed-sequence (varlen) path
+    # which is incompatible with CP-split positions.
+    fa_kwargs = {k: v for k, v in kwargs.items() if k not in ("position_ids", "use_cache")}
+
+    torch.cuda.nvtx.range_push("cp/flash_attn")
     attn_output, _ = flash_attention_forward(
         self,
         query_states,
@@ -189,11 +207,14 @@ def _cp_attention_forward(
         dropout=0.0,
         scaling=self.scaling,
         is_causal=True,
-        **kwargs,
+        **fa_kwargs,
     )
+    torch.cuda.nvtx.range_pop()
 
+    torch.cuda.nvtx.range_push("cp/out_proj")
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
+    torch.cuda.nvtx.range_pop()
     return attn_output, None
 
 
@@ -231,6 +252,7 @@ def _text_model_pre_hook(
     if inputs_embeds is None or inputs_embeds.shape[1] <= 1 or not cp.is_active:
         return args, kwargs
 
+    torch.cuda.nvtx.range_push("cp/prefill_split")
     seq_len = inputs_embeds.shape[1]
     pad_size = (cp.world_size - seq_len % cp.world_size) % cp.world_size
 
@@ -288,6 +310,7 @@ def _text_model_pre_hook(
 
     # Stash metadata for the post-hook.
     module._cp_original_seq_len = seq_len
+    torch.cuda.nvtx.range_pop()  # cp/prefill_split
     return args, kwargs
 
 
@@ -305,12 +328,16 @@ def _text_model_post_hook(
 
     del module._cp_original_seq_len
 
+    torch.cuda.nvtx.range_push("cp/gather_hidden_states")
     output.last_hidden_state = _all_gather(
         output.last_hidden_state, dim=1,
     )[:, :original_seq_len, :]
+    torch.cuda.nvtx.range_pop()
 
     if output.past_key_values is not None:
+        torch.cuda.nvtx.range_push("cp/gather_kv_cache")
         _gather_kv_cache(output.past_key_values, original_seq_len)
+        torch.cuda.nvtx.range_pop()
 
     return output
 
