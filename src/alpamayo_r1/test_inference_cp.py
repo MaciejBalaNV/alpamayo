@@ -26,6 +26,7 @@ The decode (autoregressive) phase runs identically on every rank after the
 KV-cache is gathered, so all ranks produce the same output.
 """
 
+import copy
 import os
 import time
 
@@ -102,7 +103,14 @@ def main() -> None:
         return_extra=True,
     )
 
-    # ---- warmup iterations (amortise CUDA graph capture, JIT, allocator) ----
+    def _run_inference():
+        """Deep-copy kwargs so the model's internal .pop() calls don't
+        destroy the originals for subsequent iterations."""
+        return model.sample_trajectories_from_data_with_vlm_rollout(
+            **copy.deepcopy(inference_kwargs),
+        )
+
+    # ---- warmup (amortise CUDA graph capture, JIT, allocator) ----
     for i in range(num_warmup):
         if is_main:
             print(f"Warmup {i + 1}/{num_warmup}...")
@@ -111,7 +119,7 @@ def main() -> None:
         torch.cuda.nvtx.range_push(f"warmup/{i}")
         torch.cuda.manual_seed_all(42)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            model.sample_trajectories_from_data_with_vlm_rollout(**inference_kwargs)
+            _run_inference()
         torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
 
@@ -124,9 +132,7 @@ def main() -> None:
     torch.cuda.manual_seed_all(42)
     with torch.autocast("cuda", dtype=torch.bfloat16):
         torch.cuda.nvtx.range_push("vlm_generate_and_diffusion")
-        pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
-            **inference_kwargs,
-        )
+        pred_xyz, pred_rot, extra = _run_inference()
         torch.cuda.nvtx.range_pop()  # vlm_generate_and_diffusion
     torch.cuda.nvtx.range_pop()  # inference
 
