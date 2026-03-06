@@ -92,6 +92,30 @@ def main() -> None:
     # ---- inference with context parallelism ----
     apply_context_parallel(model)
 
+    num_warmup = 2
+    inference_kwargs = dict(
+        data=model_inputs,
+        top_p=0.98,
+        temperature=0.6,
+        num_traj_samples=1,
+        max_generation_length=256,
+        return_extra=True,
+    )
+
+    # ---- warmup iterations (amortise CUDA graph capture, JIT, allocator) ----
+    for i in range(num_warmup):
+        if is_main:
+            print(f"Warmup {i + 1}/{num_warmup}...")
+        dist.barrier()
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(f"warmup/{i}")
+        torch.cuda.manual_seed_all(42)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            model.sample_trajectories_from_data_with_vlm_rollout(**inference_kwargs)
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+
+    # ---- timed iteration ----
     dist.barrier()
     torch.cuda.synchronize()
     t_start = time.perf_counter()
@@ -101,12 +125,7 @@ def main() -> None:
     with torch.autocast("cuda", dtype=torch.bfloat16):
         torch.cuda.nvtx.range_push("vlm_generate_and_diffusion")
         pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
-            data=model_inputs,
-            top_p=0.98,
-            temperature=0.6,
-            num_traj_samples=1,
-            max_generation_length=256,
-            return_extra=True,
+            **inference_kwargs,
         )
         torch.cuda.nvtx.range_pop()  # vlm_generate_and_diffusion
     torch.cuda.nvtx.range_pop()  # inference
@@ -118,7 +137,7 @@ def main() -> None:
 
     # ---- results (rank 0 only) ----
     if is_main:
-        print(f"\nInference time: {t_end - t_start:.3f}s")
+        print(f"\nInference time (after warmup): {t_end - t_start:.3f}s")
         print("Chain-of-Causation (per trajectory):\n", extra["cot"][0])
 
         gt_xy = data["ego_future_xyz"].cpu()[0, 0, :, :2].T.numpy()
